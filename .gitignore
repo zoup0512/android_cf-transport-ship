@@ -1,0 +1,17 @@
+# 构建产物
+.gradle/
+.kotlin/
+build/
+app/build/
+
+# 本机配置
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 崩溃与截图
+captures/
+*.hprof
