@@ -359,7 +359,8 @@ class Hud(val game: () -> Game?, val d: Float) {
         val pw = min(360 * d, w * 0.46f)
         val px = w - pw - 24 * d
         rr(c, px, 24 * d, pw, h - 48 * d, 12, Color.argb(235, 18, 26, 34))
-        var y = 38 * d
+        // 灵敏度/FOV/音量在暂停菜单调整；主菜单只留核心选项，避免小屏溢出
+        var y = 34 * d
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "阵营", "team", listOf(Pair("BL", "潜伏者"), Pair("GR", "保卫者")))
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "主武器", "primary", listOf(Pair("ak47", "AK-47"), Pair("m4a1", "M4A1"), Pair("awm", "AWM"), Pair("mp5", "MP5")))
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "对战规模", "size", listOf(Pair("4", "4v4"), Pair("6", "6v6"), Pair("8", "8v8")))
@@ -367,13 +368,11 @@ class Hud(val game: () -> Game?, val d: Float) {
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "电脑难度", "diff", listOf(Pair("easy", "简单"), Pair("normal", "普通"), Pair("hard", "困难"), Pair("hell", "地狱")))
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "时间", "tod", listOf(Pair("day", "白天"), Pair("dusk", "黄昏")))
         y = seg(c, g, px + 16 * d, y, pw - 32 * d, "画质", "quality", listOf(Pair("low", "流畅"), Pair("medium", "均衡"), Pair("high", "极致")))
-        y = slider(c, g, px + 16 * d, y, pw - 32 * d, "sens", "灵敏度")
-        y = slider(c, g, px + 16 * d, y, pw - 32 * d, "fov", "视野 FOV")
-        y = slider(c, g, px + 16 * d, y, pw - 32 * d, "vol", "音量")
-        // 开始按钮
-        rr(c, px + 16 * d, h - 78 * d, pw - 32 * d, 46 * d, 10, Color.argb(255, 245, 179, 33))
-        txt(c, "开 始 游 戏", px + pw / 2, h - 48 * d, 18f, Color.argb(255, 20, 24, 28), true, Paint.Align.CENTER)
-        btns.add(Btn("start", px + 16 * d, h - 78 * d, pw - 32 * d, 46 * d))
+        // 开始按钮：跟随内容流式布局，保证与任何行不重叠
+        val by = y + 6 * d
+        rr(c, px + 16 * d, by, pw - 32 * d, 40 * d, 10, Color.argb(255, 245, 179, 33))
+        txt(c, "开 始 游 戏", px + pw / 2, by + 27 * d, 16f, Color.argb(255, 20, 24, 28), true, Paint.Align.CENTER)
+        btns.add(Btn("start", px + 16 * d, by, pw - 32 * d, 40 * d))
     }
 
     private fun seg(c: Canvas, g: Game, x: Float, y: Float, w: Float, label: String, key: String, opts: List<Pair<String, String>>): Float {
@@ -383,11 +382,11 @@ class Hud(val game: () -> Game?, val d: Float) {
         for ((i, o) in opts.withIndex()) {
             val bx = x + i * (bw + 6 * d)
             val on = cur == o.first
-            rr(c, bx, y + 15 * d, bw, 26 * d, 8, if (on) Color.argb(255, 245, 179, 33) else Color.argb(50, 255, 255, 255))
-            txt(c, o.second, bx + bw / 2, y + 33 * d, 12f, if (on) Color.argb(255, 24, 28, 32) else Color.argb(220, 210, 216, 222), on, Paint.Align.CENTER)
-            btns.add(Btn("seg:$key:${o.first}", bx, y + 15 * d, bw, 26 * d))
+            rr(c, bx, y + 14 * d, bw, 22 * d, 8, if (on) Color.argb(255, 245, 179, 33) else Color.argb(50, 255, 255, 255))
+            txt(c, o.second, bx + bw / 2, y + 30 * d, 11f, if (on) Color.argb(255, 24, 28, 32) else Color.argb(220, 210, 216, 222), on, Paint.Align.CENTER)
+            btns.add(Btn("seg:$key:${o.first}", bx, y + 14 * d, bw, 22 * d))
         }
-        return y + 47 * d
+        return y + 38 * d
     }
 
     private fun slider(c: Canvas, g: Game, x: Float, y: Float, w: Float, key: String, label: String): Float {

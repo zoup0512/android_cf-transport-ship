@@ -271,7 +271,8 @@ class World {
             // 水平
             ent.x += ent.velX * h; ent.z += ent.velZ * h
             for (it2 in 0 until 3) {
-                val cands = query(ent.x - r, ent.z - r, ent.x + r, ent.z + r)
+                // 快照：循环内 blocked() 会嵌套 query()，避免复用缓冲被改动
+                val cands = query(ent.x - r, ent.z - r, ent.x + r, ent.z + r).toList()
                 var any = false
                 for (c in cands) {
                     if (!c.solid) continue
@@ -308,7 +309,7 @@ class World {
             } else {
                 ent.onGround = false; ent.ground = null
                 // 顶头
-                val cands = query(ent.x - r, ent.z - r, ent.x + r, ent.z + r)
+                val cands = query(ent.x - r, ent.z - r, ent.x + r, ent.z + r).toList()
                 for (c in cands) {
                     if (!c.solid) continue
                     val headPrev = prevY + ent.height; val head = ent.y + ent.height

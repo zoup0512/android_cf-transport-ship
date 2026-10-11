@@ -457,6 +457,7 @@ class Game(val context: Context) {
         audio.announce("Go go go!")
         hudSetHud?.invoke(3.5f, "团队竞技 · 率先达到 $goal 击杀的队伍获胜")
         playing = true; paused = false
+        hudState = ST_PLAY
         audio.setLowHealth(false)
     }
 
