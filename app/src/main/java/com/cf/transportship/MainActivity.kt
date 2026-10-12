@@ -34,6 +34,7 @@ class MainActivity : Activity() {
         val root = FrameLayout(this)
         glView = GameView(this, game)
         hudView = HudOverlay(this, game)
+        game.hud?.glPost = { r -> glView.queueEvent(r) }
         root.addView(glView, FrameLayout.LayoutParams(-1, -1))
         root.addView(hudView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
@@ -72,6 +73,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        game.audio.resumeAudio()
         glView.onResume()
     }
 
@@ -79,6 +81,8 @@ class MainActivity : Activity() {
         super.onPause()
         glView.onPause()
         if (game.playing && !game.ended && !game.paused) game.pause()
+        // 后台停止合成线程与输出，避免游戏音在后台持续播放/耗电
+        game.audio.suspendAudio()
     }
 
     override fun onDestroy() {

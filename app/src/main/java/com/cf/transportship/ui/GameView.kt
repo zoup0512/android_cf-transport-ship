@@ -45,10 +45,9 @@ class GameRenderer(private val game: Game, private val view: GameView) : GLSurfa
                     (hud?.host as? View)?.invalidate()
                 }
             }
-            view.post {
-                hud?.state = ST_MENU
-                if (game.autoStart) game.startMatch()
-            }
+            // startMatch 改动 actors/inv 等大量状态，必须与渲染循环同线程（GL 线程）
+            view.post { hud?.state = ST_MENU }
+            view.queueEvent { if (game.autoStart) game.startMatch() }
         } catch (e: Throwable) {
             android.util.Log.e("CF", "build failed", e)
             view.post {
@@ -62,6 +61,7 @@ class GameRenderer(private val game: Game, private val view: GameView) : GLSurfa
         val now = android.os.SystemClock.uptimeMillis()
         try {
             game.frameUpdate(now)
+            errCount = 0
         } catch (e: Throwable) {
             android.util.Log.e("CF", "frame error", e)
             if (errCount++ > 60) throw e

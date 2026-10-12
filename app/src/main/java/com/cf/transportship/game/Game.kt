@@ -119,7 +119,9 @@ class Game(val context: Context) {
     var aimTarget: Actor? = null
     var fps = 0
     private var fpsAcc = 0f; private var fpsN = 0
-    val nameTags = ArrayList<NameTag>(16)
+    private val nameTags = ArrayList<NameTag>(16)
+    /** 供 UI 线程读取的快照（每帧重建，避免跨线程迭代同一 ArrayList） */
+    @Volatile var nameTagsSnapshot: List<NameTag> = emptyList()
 
     // GL 资源
     private val mapMeshes = ArrayList<Triple<MatDef, StaticMesh, Int>>()
@@ -141,6 +143,8 @@ class Game(val context: Context) {
     var vmCam = Camera()
 
     var autoStart = false
+    /** buildAssets 完成前渲染线程不推进（防御 cam 等 lateinit 未初始化） */
+    @Volatile var ready = false
 
     fun sp() = context.getSharedPreferences("cf_ship_opts", Context.MODE_PRIVATE)
 
@@ -169,6 +173,11 @@ class Game(val context: Context) {
         progress(0.08f, "初始化渲染器")
         renderer.init(opts["quality"].toString(), w.toInt(), h.toInt())
         renderer.makeBlackTex()
+        // 阴影贴图（低画质关闭，uShadowOn=0 时着色器跳过采样）
+        when (opts["quality"].toString()) {
+            "high" -> renderer.createShadowMap(2048)
+            "medium" -> renderer.createShadowMap(1024)
+        }
         progress(0.15f, "生成集装箱 / 甲板 / 船体纹理")
         T = Textures.build(opts["quality"].toString())
         gunMats = GunMaterials()
@@ -206,6 +215,7 @@ class Game(val context: Context) {
         renderer.cam.fov = (opts["fov"] as Int).toFloat()
         renderer.cam.update()
         vmCam.fov = 58f; vmCam.near = 0.01f; vmCam.far = 50f
+        ready = true
         progress(1f, "完成")
     }
 
@@ -421,8 +431,10 @@ class Game(val context: Context) {
         audio.playUI("start")
         audio.startAmbient()
         audio.volMaster = (opts["vol"] as? Float) ?: 0.8f
-        actors.clear(); nades.clear(); timers.clear()
-        score["BL"] = 0; score["GR"] = 0
+        synchronized(actors) {
+            actors.clear(); nades.clear(); timers.clear()
+            score["BL"] = 0; score["GR"] = 0
+        }
         goal = opts["goal"] as Int
         timeLeft = 600f
         ended = false; inLoadout = false
@@ -435,7 +447,7 @@ class Game(val context: Context) {
         player = pl
         pl.primary = opts["primary"].toString()
         pl.applyGunAnchors()
-        actors.add(pl)
+        synchronized(actors) { actors.add(pl) }
         val N = opts["size"] as Int
         fun primFor(team: String, i: Int): String {
             if (i == 1 && N >= 4) return "awm"
@@ -448,10 +460,10 @@ class Game(val context: Context) {
             for (i in 0 until count) {
                 val b = Bot(this, id++, if (names.isNotEmpty()) names.removeAt(0) else "Bot$id", team, opts["diff"].toString())
                 b.primary = primFor(team, if (team == my) i + 1 else i)
-                actors.add(b)
+                synchronized(actors) { actors.add(b) }
             }
         }
-        for (a in actors) spawnActor(a, true)
+        synchronized(actors) { for (a in actors) spawnActor(a, true) }
         vm.setTeam(my)
         vm.equip(pl.weapon.id, 0.6f)
         audio.announce("Go go go!")
@@ -489,6 +501,12 @@ class Game(val context: Context) {
     fun pause() {
         if (!playing || ended) return
         paused = true
+        // 清空输入状态：防止暂停瞬间按住的方向/开火键在恢复后卡住
+        val p = player
+        p?.keys?.clear()
+        p?.pressed?.clear()
+        p?.mouseL = false; p?.mouseR = false; p?.mouseLP = false; p?.mouseRP = false
+        p?.touch?.fire = false; p?.touch?.jump = false
         hudState = ST_PAUSE
     }
 
@@ -501,7 +519,7 @@ class Game(val context: Context) {
         playing = false; paused = false; ended = true
         audio.stopAmbient()
         audio.setLowHealth(false)
-        actors.clear()
+        synchronized(actors) { actors.clear() }
         player = null
         vm.curVisible = false
         hudState = ST_MENU
@@ -565,8 +583,8 @@ class Game(val context: Context) {
         val d = ws.def
         a.eye(eyeV)
         a.forward(fwdV)
-        jitterDir(floatArrayOf(fwdV.x, fwdV.y, fwdV.z), spread) { Random.nextFloat() }
-        val dir = floatArrayOf(fwdV.x, fwdV.y, fwdV.z)
+        // 散布：在锥内随机扰动方向（jitterDir 就地修改并返回同一数组）
+        val dir = jitterDir(floatArrayOf(fwdV.x, fwdV.y, fwdV.z), spread) { Random.nextFloat() }
         var muzzle = Vec3()
         if (a.isPlayer) {
             val cam = renderer.cam
@@ -899,6 +917,7 @@ class Game(val context: Context) {
     var hud: com.cf.transportship.ui.Hud? = null
 
     fun frameUpdate(nowMs: Long) {
+        if (!ready) return
         var dt = (nowMs - lastMs) / 1000f
         lastMs = nowMs
         if (dt > 0.1f) dt = 0.1f
@@ -988,6 +1007,7 @@ class Game(val context: Context) {
             nameTags.add(NameTag((cxp * 0.5f + 0.5f) * w, (0.5f - cyp * 0.5f) * h, a.name,
                 if (a.team == "BL") Color999(255, 155, 112) else Color999(140, 200, 255), true))
         }
+        nameTagsSnapshot = nameTags.toList()
     }
 
     private fun Color999(r: Int, g: Int, b: Int) = android.graphics.Color.argb(255, r, g, b)
@@ -1064,7 +1084,7 @@ class Game(val context: Context) {
         renderer.fxProtect = if (p != null && p.alive && playing) min(1f, p.protectT) else 0f
         renderer.fxVignette = if (p != null && p.scoped > 0) 0f else 0.3f
         renderer.particleScale = fx.particleScaleOf(renderer.renderH, cam.fov)
-        renderGL()
+        renderGL(dt)
     }
 
     private fun updateLightProbe() {
@@ -1081,6 +1101,7 @@ class Game(val context: Context) {
     private fun updateHudValues() {
         val hd = hud ?: return
         val p = player ?: return
+        if (p.inv.isEmpty()) return
         val wst = p.weapon
         val cam = renderer.cam
         var spreadPx = 0f
@@ -1115,8 +1136,10 @@ class Game(val context: Context) {
     // ============ GL 渲染 ============
     private val boneMats = FloatArray(19 * 16)
 
-    private fun renderGL() {
+    private fun renderGL(dt: Float) {
         val cam = renderer.cam
+        // 粒子/曳光用真实帧间隔推进（夹紧，防止掉帧后跳变）
+        val fxDt = dt.coerceIn(0.001f, 0.05f)
         // 1) 阴影
         renderer.shadowPass(
             drawMap = { drawMapDepth() },
@@ -1148,7 +1171,7 @@ class Game(val context: Context) {
         }
         // 贴花 / 曳光 / 火焰
         fx.buildDecalMeshes(decalMeshMap)
-        fx.advanceTracers(0.016f)
+        fx.advanceTracers(fxDt)
         fx.buildTracerMesh(renderer.tracerMesh, Vec3(cam.px, cam.py, cam.pz))
         val camRight = Vec3(cos(cam.yaw), 0f, -sin(cam.yaw))
         val camF = Vec3(); cam.forward(camF)
@@ -1158,8 +1181,8 @@ class Game(val context: Context) {
         renderer.drawUnlit(renderer.tracerMesh, texTracer, floatArrayOf(1f, 0.88f, 0.63f, 1f), true, false)
         renderer.drawUnlit(renderer.flashMesh, texFlash[0], floatArrayOf(1f, 0.85f, 0.63f, 1f), true, false)
         // 粒子
-        val (addData, addN) = fx.add.update(0.016f)
-        val (smokeData, smokeN) = fx.smoke.update(0.016f)
+        val (addData, addN) = fx.add.update(fxDt)
+        val (smokeData, smokeN) = fx.smoke.update(fxDt)
         renderer.drawParticles(renderer.texGlow, addData, addN, true)
         renderer.drawParticles(renderer.texPuff, smokeData, smokeN, false)
         // 3) 第一人称
@@ -1256,13 +1279,12 @@ class Game(val context: Context) {
     private fun drawViewModel() {
         val p = player ?: return
         if (!playing || !vm.curVisible || vm.curId == null) return
-        val sf = renderer.sceneFbo() ?: return
+        if (renderer.sceneFbo() == null) return
         // 清深度，用 vm 相机
         glClear(android.opengl.GLES30.GL_DEPTH_BUFFER_BIT)
         val vp = vmCam.viewProj
-        // vm 光照（相机空间）
-        val savedSun = FloatArray(renderer.sunDir.let { floatArrayOf(it.x, it.y, it.z) }.size)
-        savedSun[0] = renderer.sunDir.x; savedSun[1] = renderer.sunDir.y; savedSun[2] = renderer.sunDir.z
+        // vm 光照（相机空间）：临时改写渲染器光照状态，绘制完在 finally 里恢复
+        val savedSun = Vec3().set(renderer.sunDir)
         val savedFog = renderer.fogDensity
         // 太阳方向变换到相机空间
         val inv = Mat4().set(renderer.cam.view)
@@ -1274,39 +1296,41 @@ class Game(val context: Context) {
         val fillI = 0.35f * (if (vm.indoorK) 0.5f else 1f) * 0.9f
         faSet(renderer.hemiSky, floatArrayOf(fillI, fillI, fillI))
         faSet(renderer.hemiGround, floatArrayOf(fillI * 0.5f, fillI * 0.5f, fillI * 0.5f))
-        val rd = gunRD[vm.curId!!] ?: return
-        val camPosVm = Vec3(0f, 0f, 0f)
-        for ((mat, mesh, part) in rd) {
-            val show = part == null || (vm.partState[part.name]?.visible ?: true)
-            if (!show) continue
-            val m = vmPartMatrix(part)
-            renderer.drawGunMeshVm(mat, mesh, m, vp)
+        try {
+            val rd = gunRD[vm.curId!!] ?: return
+            for ((mat, mesh, part) in rd) {
+                val show = part == null || (vm.partState[part.name]?.visible ?: true)
+                if (!show) continue
+                val m = vmPartMatrix(part)
+                renderer.drawGunMeshVm(mat, mesh, m, vp)
+            }
+            // 手臂
+            val arms = armMeshes ?: return
+            for ((pose, side) in listOf(Pair(vm.armR, "R"), Pair(vm.armL, "L"))) {
+                if (!pose.visible) continue
+                val sleeve = if (side == "R") vm.sleeveColor else vm.sleeveColor
+                renderer.drawGunMeshVmColor(arms["fore"]!!, pose.foreM, vp, sleeve, 0.9f, 0f)
+                renderer.drawGunMeshVmColor(arms["cuff"]!!, pose.cuffM, vp, vm.cuffColor, 0.8f, 0f)
+                renderer.drawGunMeshVmColor(arms["hand"]!!, pose.handM, vp, floatArrayOf(0.09f, 0.09f, 0.1f), 0.62f, 0f)
+            }
+            // 弹壳
+            val shell = shellMesh ?: return
+            for (s in vm.shells) {
+                if (s.life <= 0) continue
+                val q = Quat().setFromAxisAngle(1f, 0f, 0f, s.rx).multiply(Quat().setFromAxisAngle(0f, 1f, 0f, s.ry))
+                val m = Mat4().compose(s.x, s.y, s.z, q, 1f, 1f, 1f)
+                renderer.drawGunMeshVmColorBrass(shell, m, vp)
+            }
+            // 枪口火焰（vm 空间）
+            if (vm.flashT > 0) {
+                drawVmFlash(vp)
+            }
+        } finally {
+            // 恢复
+            renderer.sunDir.set(savedSun)
+            renderer.fogDensity = savedFog
+            applyEnv(tod)
         }
-        // 手臂
-        val arms = armMeshes ?: return
-        for ((pose, side) in listOf(Pair(vm.armR, "R"), Pair(vm.armL, "L"))) {
-            if (!pose.visible) continue
-            val sleeve = if (side == "R") vm.sleeveColor else vm.sleeveColor
-            renderer.drawGunMeshVmColor(arms["fore"]!!, pose.foreM, vp, sleeve, 0.9f, 0f)
-            renderer.drawGunMeshVmColor(arms["cuff"]!!, pose.cuffM, vp, vm.cuffColor, 0.8f, 0f)
-            renderer.drawGunMeshVmColor(arms["hand"]!!, pose.handM, vp, floatArrayOf(0.09f, 0.09f, 0.1f), 0.62f, 0f)
-        }
-        // 弹壳
-        val shell = shellMesh ?: return
-        for (s in vm.shells) {
-            if (s.life <= 0) continue
-            val q = Quat().setFromAxisAngle(1f, 0f, 0f, s.rx).multiply(Quat().setFromAxisAngle(0f, 1f, 0f, s.ry))
-            val m = Mat4().compose(s.x, s.y, s.z, q, 1f, 1f, 1f)
-            renderer.drawGunMeshVmColorBrass(shell, m, vp)
-        }
-        // 枪口火焰（vm 空间）
-        if (vm.flashT > 0) {
-            drawVmFlash(vp)
-        }
-        // 恢复
-        faSet3(renderer.sunDir, savedSun)
-        renderer.fogDensity = savedFog
-        applyEnv(tod)
     }
 
     private fun vmPartMatrix(part: GunPart?): Mat4 {

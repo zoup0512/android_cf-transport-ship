@@ -30,6 +30,8 @@ class Hud(val game: () -> Game?, val d: Float) {
     var loadProgress = 0f
     var loadText = "LOADING"
     var host: android.view.View? = null
+    /** 把会改动对局状态的操作投递到 GL 线程执行（触摸在 UI 线程触发，避免与渲染循环竞态） */
+    var glPost: (() -> Unit) -> Unit = { it() }
     val joyIdPub: Int get() = joyId
     val lookIdPub: Int get() = lookId
     fun hasBtn(id: Int): Boolean = buttonDown.containsKey(id)
@@ -64,6 +66,7 @@ class Hud(val game: () -> Game?, val d: Float) {
     private val btns = ArrayList<Btn>()
 
     // ---------- 事件推送 ----------
+    /** GL 线程写入、UI 线程绘制读取的列表统一同步，避免 ConcurrentModificationException */
     fun killFeed(killer: Actor?, victim: Actor, wid: String, hs: Boolean, wall: Boolean, mine: Boolean) {
         val kn = killer?.name ?: ""
         val wn = com.cf.transportship.game.WEAPONS[wid]?.name ?: wid
@@ -77,8 +80,10 @@ class Hud(val game: () -> Game?, val d: Float) {
             append("  ")
             append(victim.name)
         }
-        feed.add(0, FeedEntry(s, if (mine) Color.argb(255, 255, 210, 90) else Color.argb(230, 210, 216, 222), 0f))
-        while (feed.size > 6) feed.removeAt(feed.size - 1)
+        synchronized(feed) {
+            feed.add(0, FeedEntry(s, if (mine) Color.argb(255, 255, 210, 90) else Color.argb(230, 210, 216, 222), 0f))
+            while (feed.size > 6) feed.removeAt(feed.size - 1)
+        }
     }
 
     fun hitmarker(hs: Boolean, kill: Boolean) {
@@ -87,7 +92,7 @@ class Hud(val game: () -> Game?, val d: Float) {
     }
 
     fun damageFrom(ang: Float) {
-        dmgDirs.add(DmgMark(ang, 1.4f))
+        synchronized(dmgDirs) { dmgDirs.add(DmgMark(ang, 1.4f)) }
     }
 
     fun badge(text: String, sub: String, hs: Boolean) {
@@ -103,8 +108,10 @@ class Hud(val game: () -> Game?, val d: Float) {
         if (hitT > 0) hitT -= dt
         if (toastT > 0) toastT -= dt
         badge?.let { b -> b.t -= dt; if (b.t <= 0) badge = null }
-        val it = dmgDirs.iterator()
-        while (it.hasNext()) { val m = it.next(); m.t -= dt; if (m.t <= 0) it.remove() }
+        synchronized(dmgDirs) {
+            val it = dmgDirs.iterator()
+            while (it.hasNext()) { val m = it.next(); m.t -= dt; if (m.t <= 0) it.remove() }
+        }
     }
 
     // ---------- 触摸 ----------
@@ -195,7 +202,9 @@ class Hud(val game: () -> Game?, val d: Float) {
         BtnDef("jump", w - 70 * d, h - 85 * d, 32 * d),
         BtnDef("crouch", w - 145 * d, h - 65 * d, 28 * d),
         BtnDef("reload", w - 210 * d, h - 130 * d, 26 * d),
-        BtnDef("switch", w - 140 * d, h - 150 * d, 26 * d),
+        // 原先在 (w-140d,h-150d)，与 fire 命中圆重叠（中心距 40d < fire 半径 48d），
+        // 移到 reload 下方、crouch 左侧的空位
+        BtnDef("switch", w - 215 * d, h - 75 * d, 26 * d),
         BtnDef("inspect", w - 265 * d, h - 130 * d, 22 * d),
         BtnDef("pause", w - 40 * d, 44 * d, 22 * d),
         BtnDef("board", w - 100 * d, 44 * d, 22 * d),
@@ -212,9 +221,9 @@ class Hud(val game: () -> Game?, val d: Float) {
             "reload" -> p.pressed.add("KeyR")
             "switch" -> p.pressed.add("KeyQ")
             "inspect" -> p.pressed.add("KeyF")
-            "pause" -> { g.pause(); playClick() }
+            "pause" -> glPost { g.pause(); playClick() }
             "board" -> boardShown = true
-            "loadout" -> { g.toggleLoadout(); playClick() }
+            "loadout" -> glPost { g.toggleLoadout(); playClick() }
         }
     }
 
@@ -251,12 +260,12 @@ class Hud(val game: () -> Game?, val d: Float) {
                         sliderDrag = b.id.removePrefix("slider:")
                         applySlider(g, sliderDrag!!, x)
                     }
-                    b.id == "start" -> { playClick(); g.startMatch() }
-                    b.id == "resume" -> { playClick(); g.resume() }
-                    b.id == "quit" -> { playClick(); g.quitToMenu() }
-                    b.id == "again" -> { playClick(); g.startMatch() }
-                    b.id == "menu" -> { playClick(); g.quitToMenu() }
-                    b.id.startsWith("load:") -> { playClick(); g.chooseLoadout(b.id.removePrefix("load:")) }
+                    b.id == "start" -> { playClick(); glPost { g.startMatch() } }
+                    b.id == "resume" -> { playClick(); glPost { g.resume() } }
+                    b.id == "quit" -> { playClick(); glPost { g.quitToMenu() } }
+                    b.id == "again" -> { playClick(); glPost { g.startMatch() } }
+                    b.id == "menu" -> { playClick(); glPost { g.quitToMenu() } }
+                    b.id.startsWith("load:") -> { playClick(); val id = b.id.removePrefix("load:"); glPost { g.chooseLoadout(id) } }
                     b.id == "loadclose" -> { playClick(); g.closeLoadout() }
                 }
                 return
@@ -390,7 +399,7 @@ class Hud(val game: () -> Game?, val d: Float) {
     }
 
     private fun slider(c: Canvas, g: Game, x: Float, y: Float, w: Float, key: String, label: String): Float {
-        txt(c, label, x, y + 12 * d, 12f, Color.argb(200, 190, 198, 206))
+        txt(c, label, x, y + 11 * d, 12f, Color.argb(200, 190, 198, 206))
         val v = when (key) {
             "sens" -> (g.opts["sens"] as? Float) ?: 1f
             "fov" -> ((g.opts["fov"] as? Int) ?: 78).toFloat()
@@ -401,17 +410,17 @@ class Hud(val game: () -> Game?, val d: Float) {
             "fov" -> (v - 65f) / 35f
             else -> v
         }
-        rr(c, x, y + 22 * d, w, 6 * d, 3, Color.argb(50, 255, 255, 255))
-        rr(c, x, y + 22 * d, w * t.coerceIn(0f, 1f), 6 * d, 3, Color.argb(255, 245, 179, 33))
-        c.drawCircle(x + w * t.coerceIn(0f, 1f), y + 25 * d, 9 * d, pFill.apply { color = Color.argb(255, 235, 238, 240) })
+        rr(c, x, y + 20 * d, w, 5 * d, 2, Color.argb(50, 255, 255, 255))
+        rr(c, x, y + 20 * d, w * t.coerceIn(0f, 1f), 5 * d, 2, Color.argb(255, 245, 179, 33))
+        c.drawCircle(x + w * t.coerceIn(0f, 1f), y + 22.5f * d, 8 * d, pFill.apply { color = Color.argb(255, 235, 238, 240) })
         val disp = when (key) {
             "sens" -> String.format("%.2f", v)
             "fov" -> "${v.toInt()}"
             else -> String.format("%.0f%%", v * 100)
         }
-        txt(c, disp, x + w, y + 14 * d, 12f, Color.argb(220, 245, 179, 33), false, Paint.Align.RIGHT)
-        btns.add(Btn("slider:$key", x - 10 * d, y + 8 * d, w + 20 * d, 34 * d))
-        return y + 42 * d
+        txt(c, disp, x + w, y + 12 * d, 12f, Color.argb(220, 245, 179, 33), false, Paint.Align.RIGHT)
+        btns.add(Btn("slider:$key", x - 10 * d, y + 2 * d, w + 20 * d, 30 * d))
+        return y + 36 * d
     }
 
     // ---------- 局内 HUD ----------
@@ -445,31 +454,33 @@ class Hud(val game: () -> Game?, val d: Float) {
             c.scale(zoom, zoom)
             c.translate(-(p.pos.x + 37) * S, -(p.pos.z + 13) * S)
             c.drawBitmap(bmp, 0f, 0f, null)
-            for (a in g.actors) {
-                if (a === p) continue
-                val seen = a.team == p.team || a.radarT > 0
-                if (!seen) continue
-                val ax = (a.pos.x + 37) * S
-                val az = (a.pos.z + 13) * S
-                if (!a.alive) {
-                    if (a.team != p.team || a.deadT > 5) continue
-                    pStroke.color = Color.argb(200, 150, 160, 168)
-                    pStroke.strokeWidth = 2.5f * d
-                    c.drawLine(ax - 5, az - 5, ax + 5, az + 5, pStroke)
-                    c.drawLine(ax + 5, az - 5, ax - 5, az + 5, pStroke)
-                    continue
-                }
-                if (a.team == p.team) {
-                    c.save()
-                    c.translate(ax, az); c.rotate(Math.toDegrees(-a.yaw.toDouble()).toFloat())
-                    pFill.color = Color.argb(255, 79, 176, 255)
-                    val tri = android.graphics.Path()
-                    tri.moveTo(0f, -7f); tri.lineTo(5f, 5f); tri.lineTo(0f, 2.5f); tri.lineTo(-5f, 5f); tri.close()
-                    c.drawPath(tri, pFill)
-                    c.restore()
-                } else {
-                    pFill.color = Color.argb((a.radarT.coerceIn(0f, 1f) * 255).toInt(), 255, 74, 58)
-                    c.drawCircle(ax, az, 5 * d, pFill)
+            synchronized(g.actors) {
+                for (a in g.actors) {
+                    if (a === p) continue
+                    val seen = a.team == p.team || a.radarT > 0
+                    if (!seen) continue
+                    val ax = (a.pos.x + 37) * S
+                    val az = (a.pos.z + 13) * S
+                    if (!a.alive) {
+                        if (a.team != p.team || a.deadT > 5) continue
+                        pStroke.color = Color.argb(200, 150, 160, 168)
+                        pStroke.strokeWidth = 2.5f * d
+                        c.drawLine(ax - 5, az - 5, ax + 5, az + 5, pStroke)
+                        c.drawLine(ax + 5, az - 5, ax - 5, az + 5, pStroke)
+                        continue
+                    }
+                    if (a.team == p.team) {
+                        c.save()
+                        c.translate(ax, az); c.rotate(Math.toDegrees(-a.yaw.toDouble()).toFloat())
+                        pFill.color = Color.argb(255, 79, 176, 255)
+                        val tri = android.graphics.Path()
+                        tri.moveTo(0f, -7f); tri.lineTo(5f, 5f); tri.lineTo(0f, 2.5f); tri.lineTo(-5f, 5f); tri.close()
+                        c.drawPath(tri, pFill)
+                        c.restore()
+                    } else {
+                        pFill.color = Color.argb((a.radarT.coerceIn(0f, 1f) * 255).toInt(), 255, 74, 58)
+                        c.drawCircle(ax, az, 5 * d, pFill)
+                    }
                 }
             }
             c.restore()
@@ -548,24 +559,28 @@ class Hud(val game: () -> Game?, val d: Float) {
             }
         }
         // 受击方向
-        for (m in dmgDirs) {
-            val rel = m.ang - p.yaw
-            val cx = w / 2; val cy = h / 2
-            c.save()
-            c.translate(cx, cy)
-            c.rotate(Math.toDegrees(-rel.toDouble()).toFloat())
-            pStroke.color = Color.argb((m.t.coerceIn(0f, 1f) * 220).toInt(), 255, 70, 50)
-            pStroke.strokeWidth = 5 * d
-            val r0 = 64 * d
-            val arc = RectF(-r0, -r0, r0, r0)
-            c.drawArc(arc, -30f, 60f, false, pStroke)
-            c.restore()
+        synchronized(dmgDirs) {
+            for (m in dmgDirs) {
+                val rel = m.ang - p.yaw
+                val cx = w / 2; val cy = h / 2
+                c.save()
+                c.translate(cx, cy)
+                c.rotate(Math.toDegrees(-rel.toDouble()).toFloat())
+                pStroke.color = Color.argb((m.t.coerceIn(0f, 1f) * 220).toInt(), 255, 70, 50)
+                pStroke.strokeWidth = 5 * d
+                val r0 = 64 * d
+                val arc = RectF(-r0, -r0, r0, r0)
+                c.drawArc(arc, -30f, 60f, false, pStroke)
+                c.restore()
+            }
         }
         // 击杀信息
         var fy = 66 * d
-        for (f in feed) {
-            txt(c, f.text, w - 16 * d, fy, 12f, f.color, false, Paint.Align.RIGHT)
-            fy += 19 * d
+        synchronized(feed) {
+            for (f in feed) {
+                txt(c, f.text, w - 16 * d, fy, 12f, f.color, false, Paint.Align.RIGHT)
+                fy += 19 * d
+            }
         }
         // 连杀徽章
         badge?.let { b ->
@@ -588,6 +603,14 @@ class Hud(val game: () -> Game?, val d: Float) {
         if (aimName.isNotEmpty()) {
             val col = if (aimTeam == "BL") Color.argb(255, 255, 155, 112) else Color.argb(255, 140, 200, 255)
             txt(c, aimName, w / 2, h / 2 + 34 * d, 13f, col, false, Paint.Align.CENTER)
+        }
+        // 队友头顶名牌（Game 每帧发布的屏幕坐标快照）
+        if (p.alive) {
+            for (nt in g.nameTagsSnapshot) {
+                if (!nt.visible) continue
+                if (nt.x < 0 || nt.x > w || nt.y < 0 || nt.y > h) continue
+                txt(c, nt.name, nt.x, nt.y, 12f, nt.color, false, Paint.Align.CENTER)
+            }
         }
         // 计分板
         if (boardShown) drawBoard(c, w, h)
@@ -692,7 +715,7 @@ class Hud(val game: () -> Game?, val d: Float) {
         txt(c, "$name · ${g.score[team] ?: 0}", x + w / 2, y + 12 * d, 13f, col, true, Paint.Align.CENTER)
         txt(c, "击杀  死亡  爆头  延迟", x + w - 8 * d, y + 32 * d, 10f, Color.argb(160, 170, 178, 186), false, Paint.Align.RIGHT)
         var yy = y + 50 * d
-        val rows = g.actors.filter { it.team == team }.sortedByDescending { it.stats.k }
+        val rows = synchronized(g.actors) { g.actors.filter { it.team == team }.sortedByDescending { it.stats.k } }
         val me = g.player
         for (a in rows) {
             val mine = a === me
@@ -709,21 +732,32 @@ class Hud(val game: () -> Game?, val d: Float) {
         val g = game() ?: return
         val pw = min(340 * d, w * 0.5f)
         val px = (w - pw) / 2
-        val py = h * 0.1f
-        val ph = h * 0.8f
+        // 流式布局：面板高度按内容计算并垂直居中；
+        // 极小屏放不下时丢弃「时间」行（主菜单仍可调），杜绝按钮重叠
+        val avail = h - 24 * d
+        var need = 50 * d + 3 * 36 * d + 38 * d + 12 * d + 40 * d + 20 * d
+        val showTod = need <= avail
+        if (!showTod) need -= 38 * d
+        val ph = min(need, avail)
+        val py = ((h - ph) / 2).coerceAtLeast(12 * d)
         rr(c, px, py, pw, ph, 12, Color.argb(240, 14, 20, 26))
-        txt(c, "暂停", px + pw / 2, py + 40 * d, 22f, Color.argb(255, 235, 238, 240), true, Paint.Align.CENTER)
-        var y = py + 64 * d
-        y = slider(c, g, px + 20 * d, y, pw - 40 * d, "sens", "鼠标灵敏度")
+        txt(c, "暂停", px + pw / 2, py + 36 * d, 22f, Color.argb(255, 235, 238, 240), true, Paint.Align.CENTER)
+        var y = py + 50 * d
+        y = slider(c, g, px + 20 * d, y, pw - 40 * d, "sens", "灵敏度")
         y = slider(c, g, px + 20 * d, y, pw - 40 * d, "fov", "视野 FOV")
         y = slider(c, g, px + 20 * d, y, pw - 40 * d, "vol", "音量")
-        y = seg(c, g, px + 20 * d, y, pw - 40 * d, "时间", "tod", listOf(Pair("day", "白天"), Pair("dusk", "黄昏")))
-        rr(c, px + 20 * d, py + ph - 76 * d, pw - 40 * d, 44 * d, 10, Color.argb(255, 245, 179, 33))
-        txt(c, "继 续", px + pw / 2, py + ph - 47 * d, 16f, Color.argb(255, 20, 24, 28), true, Paint.Align.CENTER)
-        btns.add(Btn("resume", px + 20 * d, py + ph - 76 * d, pw - 40 * d, 44 * d))
-        rr(c, px + 20 * d, py + ph - 120 * d, pw - 40 * d, 36 * d, 10, Color.argb(70, 255, 255, 255))
-        txt(c, "退出到主菜单", px + pw / 2, py + ph - 96 * d, 14f, Color.argb(240, 220, 226, 232), false, Paint.Align.CENTER)
-        btns.add(Btn("quit", px + 20 * d, py + ph - 120 * d, pw - 40 * d, 36 * d))
+        if (showTod) y = seg(c, g, px + 20 * d, y, pw - 40 * d, "时间", "tod", listOf(Pair("day", "白天"), Pair("dusk", "黄昏")))
+        // 按钮跟随内容流式排列，左右并排
+        val by = y + 10 * d
+        val bwAll = pw - 40 * d
+        val rw = bwAll * 0.56f
+        val qw = bwAll - rw - 8 * d
+        rr(c, px + 20 * d, by, rw, 40 * d, 10, Color.argb(255, 245, 179, 33))
+        txt(c, "继 续", px + 20 * d + rw / 2, by + 26 * d, 16f, Color.argb(255, 20, 24, 28), true, Paint.Align.CENTER)
+        btns.add(Btn("resume", px + 20 * d, by, rw, 40 * d))
+        rr(c, px + 20 * d + rw + 8 * d, by, qw, 40 * d, 10, Color.argb(70, 255, 255, 255))
+        txt(c, "退出", px + 20 * d + rw + 8 * d + qw / 2, by + 26 * d, 14f, Color.argb(240, 220, 226, 232), false, Paint.Align.CENTER)
+        btns.add(Btn("quit", px + 20 * d + rw + 8 * d, by, qw, 40 * d))
     }
 
     // ---------- 换装 ----------
