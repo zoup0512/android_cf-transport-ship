@@ -106,6 +106,8 @@ class Effects(val sceneMax: Int = 900) {
     private var decalMI = 0; private var decalWI = 0; private var decalBI = 0; private var decalSI = 0
     private val decalMaxMetal = 160; private val decalMaxWood = 100
     private val decalMaxBlood = 60; private val decalMaxScorch = 12
+    // 脏标记：贴花列表无变化时跳过网格重建（原先每帧全量重建，数千次分配）
+    private var decalDirty = true
 
     // 曳光
     val tracers = ArrayList<Tracer>()
@@ -225,6 +227,7 @@ class Effects(val sceneMax: Int = 900) {
         val q = DecalQuad(p.x + n.x * 0.004f, p.y + n.y * 0.004f, p.z + n.z * 0.004f, n.x, n.y, n.z, size)
         if (list.size < max) list.add(q) else { list[(Math.random() * max).toInt()] = q }
         bump()
+        decalDirty = true
     }
 
     fun bloodSplat(p: Vec3) {
@@ -287,6 +290,8 @@ class Effects(val sceneMax: Int = 900) {
 
     // ---------- 网格构建 ----------
     fun buildDecalMeshes(meshes: Map<String, DynamicMesh>) {
+        if (!decalDirty) return
+        decalDirty = false
         meshes["metal"]?.let { fill(it, decalMetal) }
         meshes["wood"]?.let { fill(it, decalWood) }
         meshes["blood"]?.let { fill(it, decalBlood) }

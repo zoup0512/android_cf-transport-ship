@@ -164,12 +164,15 @@ class Renderer {
 
     fun resize(w: Int, h: Int) {
         surfaceW = w; surfaceH = h
+        // w/h 已是物理像素：按「有效 dpr 上限 / 设备 dpr」折算到物理像素的比例，
+        // 高密度屏（如 dpr=3）上 medium 档实际渲染约 0.38 倍边长，避免超原生分辨率
         val dpr = android.content.res.Resources.getSystem().displayMetrics.density
-        val scale = when (quality) {
-            "high" -> kotlin.math.min(dpr, 1.5f)
-            "medium" -> kotlin.math.min(dpr, 1.15f)
+        val cap = when (quality) {
+            "high" -> 1.5f
+            "medium" -> 1.15f
             else -> 1.0f
         }
+        val scale = (cap / kotlin.math.max(dpr, 1f)).coerceAtMost(1f)
         renderW = (w * scale).toInt().coerceAtLeast(64)
         renderH = (h * scale).toInt().coerceAtLeast(64)
         sceneFbo?.dispose()
@@ -198,6 +201,7 @@ class Renderer {
     fun createShadowMap(size: Int) {
         shadowSize = size
         shadowFbo?.dispose()
+        if (shadowTex != 0) GLU.deleteTex(shadowTex)
         shadowTex = GLU.createDepthTex(size, size)
         val fbo = IntArray(1)
         glGenFramebuffers(1, fbo, 0)
@@ -274,6 +278,11 @@ class Renderer {
         glEnable(GL_CULL_FACE)
     }
 
+    // 预分配：避免每帧在 GL 线程产生垃圾
+    private val ppBuf = FloatArray(MAX_POINT_LIGHTS * 4)
+    private val pcBuf = FloatArray(MAX_POINT_LIGHTS * 4)
+    private val identityM = Mat4()
+
     fun setCameraUniforms(p: Prg, viewProj: Mat4, camPos: Vec3) {
         p.use()
         p.mat4("uViewProj", viewProj.m)
@@ -286,8 +295,8 @@ class Renderer {
         p.vec3v("uFogColor", fogColor)
         p.f("uFogDensity", fogDensity)
         // 点光源
-        val pp = FloatArray(MAX_POINT_LIGHTS * 4)
-        val pc = FloatArray(MAX_POINT_LIGHTS * 4)
+        val pp = ppBuf
+        val pc = pcBuf
         for (i in 0 until MAX_POINT_LIGHTS) {
             val L = pointLights[i]
             pp[i * 4] = L.pos.x; pp[i * 4 + 1] = L.pos.y; pp[i * 4 + 2] = L.pos.z
@@ -297,6 +306,7 @@ class Renderer {
         p.vec4vArray("uPointPos", pp, MAX_POINT_LIGHTS)
         p.vec4vArray("uPointCol", pc, MAX_POINT_LIGHTS)
         p.i("uPointCount", pointCount)
+        p.f("uShadowOn", if (shadowFbo != null) 1f else 0f)
         glActiveTexture(GL_TEXTURE3)
         glBindTexture(GL_TEXTURE_2D, shadowTex)
         p.i("uShadowMap", 3)
@@ -324,7 +334,7 @@ class Renderer {
 
     fun drawStaticBatches(batches: List<Triple<MatDef, StaticMesh, Int>>, aoTex: Int) {
         setCameraUniforms(pMap, cam.viewProj, cam.pos)
-        pMap.mat4("uModel", Mat4().m)
+        pMap.mat4("uModel", identityM.m)
         for ((def, mesh, _) in batches) {
             setMatUniforms(pMap, def, if (def.key == "deck") aoTex else 0)
             mesh.draw()
@@ -430,10 +440,15 @@ class Renderer {
 
     private val waveData = FloatArray(24)
     fun setWaves(waves: List<FloatArray>) {
+        java.util.Arrays.fill(waveData, 0f)
         for (i in waves.indices) {
             val w = waves[i]
             val l = kotlin.math.sqrt(w[0] * w[0] + w[1] * w[1])
             waveData[i * 4] = w[0] / l; waveData[i * 4 + 1] = w[1] / l; waveData[i * 4 + 2] = w[2]; waveData[i * 4 + 3] = w[3]
+        }
+        // 空槽填入长波长的零陡度波，避免 shader 里 k=6.28/wavelength 出现 inf/NaN
+        for (i in waves.size until 6) {
+            waveData[i * 4] = 1f; waveData[i * 4 + 1] = 0f; waveData[i * 4 + 2] = 0f; waveData[i * 4 + 3] = 1000f
         }
     }
 
@@ -482,6 +497,9 @@ class Renderer {
         glEnable(GL_CULL_FACE)
     }
 
+    // 粒子上传缓冲（按 add/smoke 两个槽复用，避免每帧分配直接内存）
+    private val particleBuf = arrayOfNulls<java.nio.FloatBuffer>(2)
+
     fun drawParticles(tex: Int, data: FloatArray?, count: Int, additive: Boolean) {
         if (data == null || count == 0) return
         pParticle.use()
@@ -494,9 +512,18 @@ class Renderer {
         if (additive) glBlendFunc(GL_SRC_ALPHA, GL_ONE) else glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glDepthMask(false)
         glDisable(GL_CULL_FACE)
-        val vbo = if (additive) particleVbo[0] else particleVbo[1]
+        val slot = if (additive) 0 else 1
+        var fb = particleBuf[slot]
+        if (fb == null || fb.capacity() < data.size) {
+            fb = java.nio.ByteBuffer.allocateDirect(data.size * 4).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+            particleBuf[slot] = fb
+        }
+        fb!!.clear()
+        fb.put(data, 0, count * 8)
+        fb.position(0)
+        val vbo = particleVbo[slot]
         glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, count * 32, GLU.floatBuffer(data), GL_DYNAMIC_DRAW)
+        glBufferData(GL_ARRAY_BUFFER, count * 32, fb, GL_DYNAMIC_DRAW)
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(0, 3, GL_FLOAT, false, 32, 0)
         glEnableVertexAttribArray(1)

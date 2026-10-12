@@ -92,7 +92,7 @@ object GLU {
 }
 
 /** 离屏渲染目标：颜色纹理 + 深度 RBO */
-class Fbo(val w: Int, val h: Int, val colorTex: Int, val fbo: Int) {
+class Fbo(val w: Int, val h: Int, val colorTex: Int, val fbo: Int, private val depthRbo: Int = 0) {
     fun bind() {
         glBindFramebuffer(GL_FRAMEBUFFER, fbo)
         glViewport(0, 0, w, h)
@@ -100,6 +100,7 @@ class Fbo(val w: Int, val h: Int, val colorTex: Int, val fbo: Int) {
     fun dispose() {
         glDeleteFramebuffers(1, intArrayOf(fbo), 0)
         GLU.deleteTex(colorTex)
+        if (depthRbo != 0) glDeleteRenderbuffers(1, intArrayOf(depthRbo), 0)
     }
 
     companion object {
@@ -121,20 +122,26 @@ class Fbo(val w: Int, val h: Int, val colorTex: Int, val fbo: Int) {
             glGenFramebuffers(1, fboArr, 0)
             glBindFramebuffer(GL_FRAMEBUFFER, fboArr[0])
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[0], 0)
+            var rbo = 0
             if (withDepth) {
-                val rbo = IntArray(1)
-                glGenRenderbuffers(1, rbo, 0)
-                glBindRenderbuffer(GL_RENDERBUFFER, rbo[0])
+                val rboArr = IntArray(1)
+                glGenRenderbuffers(1, rboArr, 0)
+                rbo = rboArr[0]
+                glBindRenderbuffer(GL_RENDERBUFFER, rbo)
                 glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h)
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo[0])
-                glDeleteRenderbuffers(1, rbo, 0) // 挂到 FBO 后引用由 FBO 持有
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo)
+                // 注意：ES 规范下删除“挂在当前绑定 FBO 上”的 RBO 会先被分离，
+                // 必须保留 id由 dispose() 统一释放
             }
             val st = glCheckFramebufferStatus(GL_FRAMEBUFFER)
             glBindFramebuffer(GL_FRAMEBUFFER, 0)
             if (st != GL_FRAMEBUFFER_COMPLETE) {
+                glDeleteFramebuffers(1, fboArr, 0)
+                GLU.deleteTex(tex[0])
+                if (rbo != 0) glDeleteRenderbuffers(1, intArrayOf(rbo), 0)
                 throw RuntimeException("FBO incomplete: 0x${Integer.toHexString(st)} (${w}x$h halfFloat=$halfFloat)")
             }
-            return Fbo(w, h, tex[0], fboArr[0])
+            return Fbo(w, h, tex[0], fboArr[0], rbo)
         }
     }
 }

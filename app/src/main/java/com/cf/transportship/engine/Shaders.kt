@@ -14,8 +14,9 @@ object Shaders {
         uniform float uMetalness;
         uniform vec3 uEmissive;
         uniform float uAlphaTest;
-        uniform float uUseAO;
+        uniform bool uUseAO;
         uniform sampler2D uAOMap;
+        uniform float uShadowOn;
         uniform vec3 uSunDir;
         uniform vec3 uSunColor;
         uniform vec3 uHemiSky;
@@ -65,6 +66,7 @@ object Shaders {
         }
 
         float shadowFactor(vec4 sc, vec3 N) {
+            if (uShadowOn < 0.5) return 1.0;
             vec3 p = sc.xyz / sc.w;
             if (p.x < 0.001 || p.x > 0.999 || p.y < 0.001 || p.y > 0.999 || p.z >= 1.0) return 1.0;
             float bias = max(0.0006 * (1.0 - dot(N, normalize(uSunDir))), 0.0001);
@@ -97,6 +99,7 @@ object Shaders {
         layout(location=2) in vec2 aUV;
         layout(location=3) in vec2 aUV2;
         uniform mat4 uViewProj;
+        uniform mat4 uModel;
         uniform mat4 uLightMat;
         out vec3 vWorld;
         out vec3 vNormal;
@@ -104,12 +107,13 @@ object Shaders {
         out vec2 vUV2;
         out vec4 vShadow;
         void main() {
-            vWorld = aPos;
-            vNormal = aNormal;
+            vec4 wp = uModel * vec4(aPos, 1.0);
+            vWorld = wp.xyz;
+            vNormal = normalize((uModel * vec4(aNormal, 0.0)).xyz);
             vUV = aUV;
             vUV2 = aUV2;
-            vShadow = uLightMat * vec4(aPos, 1.0);
-            gl_Position = uViewProj * vec4(aPos, 1.0);
+            vShadow = uLightMat * wp;
+            gl_Position = uViewProj * wp;
         }"""
 
     const val MAP_FRAG = """#version 300 es
@@ -127,7 +131,7 @@ object Shaders {
             if (uAlphaTest > 0.0 && texel.a < uAlphaTest) discard;
             vec3 N = normalize(vNormal);
             if (uHasNormalMap) N = normalFromMap(vUV, N, vWorld);
-            float ao = uUseAO > 0.5 ? texture(uAOMap, vUV2).r : 1.0;
+            float ao = uUseAO ? texture(uAOMap, vUV2).r : 1.0;
             float sh = shadowFactor(vShadow, N);
             vec3 col = shade(albedo, N, vWorld, uRoughness, uMetalness) * sh;
             col += uEmissive * ao;
@@ -254,14 +258,14 @@ object Shaders {
         uniform vec3 uFogColor;
         uniform float uFogDensity;
         uniform vec3 uCamPos;
-        uniform float uFogOn;
+        uniform bool uFogOn;
         in vec2 vUV;
         in vec3 vWorld;
         out vec4 fragColor;
         void main() {
             vec4 t = texture(uMap, vUV) * uTint;
             if (t.a < 0.003) discard;
-            if (uFogOn > 0.5) {
+            if (uFogOn) {
                 float d = length(vWorld - uCamPos);
                 float f = 1.0 - exp(-uFogDensity * uFogDensity * d * d);
                 t.rgb = mix(t.rgb, uFogColor, f);

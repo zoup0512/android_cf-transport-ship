@@ -106,12 +106,22 @@ class DynamicMesh(val layout: Layout, maxVerts: Int) {
         vertCount += 4
     }
 
+    private var uploadBuf: java.nio.FloatBuffer? = null
+
     fun uploadAndDraw() {
         if (vertCount == 0) return
         val count = vertCount * layout.stride / 4
+        var fb = uploadBuf
+        if (fb == null) {
+            fb = java.nio.ByteBuffer.allocateDirect(data.size * 4).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
+            uploadBuf = fb
+        }
+        fb.clear()
+        fb.put(data, 0, count)
+        fb.position(0)
         glBindVertexArray(vao[0])
         glBindBuffer(GL_ARRAY_BUFFER, vbo[0])
-        glBufferSubData(GL_ARRAY_BUFFER, 0, count * 4, GLU.floatBuffer(data.copyOf(count)))
+        glBufferSubData(GL_ARRAY_BUFFER, 0, count * 4, fb)
         glDrawElements(GL_TRIANGLES, vertCount / 4 * 6, GL_UNSIGNED_INT, 0)
         glBindVertexArray(0)
     }
