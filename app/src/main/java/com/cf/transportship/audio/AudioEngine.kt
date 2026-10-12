@@ -27,14 +27,15 @@ class Layer {
     var f0 = 0f; var f1 = 0f; var sw = 0f
     var fmRate = 0f; var fmDepth = 0f
     var det = 0f                       // 半音失谐
+    var detMul = 1.0                   // 2^(det/12)，预计算避免逐样本 pow
     val env = Env()
     var filters: List<FilterSpec> = listOf()
     var drivePre = 0f; var drivePost = 1f; var hasDrive = false
     var delay = 0f                     // 相对 voice 开始的延迟（秒）
     var wet = 0f
-    var age = 0f
-    var phase = 0f
-    var fmPhase = 0f
+    var age = 0.0                      // 双精度：48kHz 下 Float 累积 ~256s 后增量丢失
+    var phase = 0.0
+    var fmPhase = 0.0
     var lfoGainRate = 0f; var lfoGainDepth = 0f   // 环境层用
     var lfoFRate = 0f; var lfoFDepth = 0f
     var baseGain = 1f                  // 环境层基础增益
@@ -60,9 +61,10 @@ class AudioEngine(private val audioMgr: AudioManager?) {
 
     private val bank = NoiseBank(sr)
     private val reverb = Reverb(sr)
-    private var track: AudioTrack? = null
+    @Volatile private var track: AudioTrack? = null
     private var thread: Thread? = null
     @Volatile private var running = false
+    @Volatile private var suspended = false
 
     private val voices = ArrayList<Voice>()
     private val ambient = ArrayList<Voice>()
@@ -102,7 +104,8 @@ class AudioEngine(private val audioMgr: AudioManager?) {
     fun start() {
         if (running) return
         val minBuf = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT)
-        val bufSize = max(minBuf, chunk * 8)
+        // chunk*2*4 = 单块字节数；×8 约 85ms 余量，避免低负载调度下欠载
+        val bufSize = max(minBuf, chunk * 2 * 4 * 8)
         track = AudioTrack(
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_GAME)
@@ -113,16 +116,26 @@ class AudioEngine(private val audioMgr: AudioManager?) {
             bufSize, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE,
         )
         running = true
+        suspended = false
         track?.play()
         thread = Thread({
             val out = FloatArray(chunk * 2)
             while (running) {
+                if (suspended) {
+                    try { Thread.sleep(40) } catch (e: InterruptedException) { break }
+                    continue
+                }
                 renderChunk()
                 for (i in 0 until chunk) {
                     out[i * 2] = mixL[i]
                     out[i * 2 + 1] = mixR[i]
                 }
-                track?.write(out, 0, out.size, AudioTrack.WRITE_BLOCKING)
+                val t = track ?: break
+                try {
+                    t.write(out, 0, out.size, AudioTrack.WRITE_BLOCKING)
+                } catch (e: Exception) {
+                    if (!running) break
+                }
             }
         }, "cf-audio")
         thread?.priority = Thread.MAX_PRIORITY - 1
@@ -131,9 +144,22 @@ class AudioEngine(private val audioMgr: AudioManager?) {
 
     fun stop() {
         running = false
-        try { thread?.join(500) } catch (e: Exception) {}
+        try { thread?.interrupt() } catch (e: Exception) {}
+        try { thread?.join(1000) } catch (e: Exception) {}
         try { track?.stop(); track?.release() } catch (e: Exception) {}
         track = null
+    }
+
+    /** Activity 失去前台时挂起合成线程与输出（省电、避免后台播放游戏音） */
+    fun suspendAudio() {
+        suspended = true
+        try { track?.pause() } catch (e: Exception) {}
+    }
+
+    fun resumeAudio() {
+        if (!running) return
+        suspended = false
+        try { track?.flush(); track?.play() } catch (e: Exception) {}
     }
 
     fun setListener(pos: FloatArray, fwd: FloatArray?) {
@@ -207,6 +233,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
         l.f0 = f; l.f1 = f1; l.sw = sw
         if (fm != null) { l.fmRate = fm[0]; l.fmDepth = fm[1] }
         l.det = det
+        if (det != 0f) l.detMul = Math.pow(2.0, (det / 12f).toDouble())
         l.delay = delay
         l.env.setup(a, dur, g, hold)
         l.filters = flt
@@ -749,7 +776,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
     fun startAmbient() {
         if (ambOn) return
         ambOn = true
-        val out = Voice().apply { bus = 2; gain = 1f }
+        val out = Voice().apply { bus = 2; gain = 1f; wetScale = 1f }
         synchronized(ambient) { ambient.add(out) }
         // 海浪：褐噪声 + 慢速 LFO 起伏（左右两层）
         for (side in floatArrayOf(-0.65f, 0.65f)) {
@@ -763,7 +790,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
             l.lfoFRate = rand(0.04f, 0.08f); l.lfoFDepth = 300f
             l.baseGain = 0.1f
             l.wet = 0.1f
-            out.layers.add(l)
+            addLayer(out, l)
         }
         // 浪花泡沫
         run {
@@ -774,7 +801,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
             l.env.setup(0.001f, 1e9f, 0.03f, 0f)
             l.filters = listOf(FilterSpec("bandpass", 1300f, 1300f, 0f, 0.6f))
             l.lfoGainRate = 0.083f; l.lfoGainDepth = 0.025f
-            out.layers.add(l)
+            addLayer(out, l)
         }
         // 海风
         run {
@@ -786,7 +813,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
             l.filters = listOf(FilterSpec("bandpass", 520f, 520f, 0f, 1.1f))
             l.lfoFRate = 0.047f; l.lfoFDepth = 110f
             l.lfoGainRate = 0.031f; l.lfoGainDepth = 0.02f
-            out.layers.add(l)
+            addLayer(out, l)
             windVoice = out
         }
         // 柴油主机
@@ -808,7 +835,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
                 l.lfoFRate = 0.17f; l.lfoFDepth = f0 * 0.35f
                 l.lfoFRate = 0.43f // 二重 LFO 简化为一个
                 l.baseGain = h[1] * 0.05f
-                out.layers.add(l)
+                addLayer(out, l)
             }
             // 船体低频隆隆
             val l = Layer()
@@ -817,7 +844,7 @@ class AudioEngine(private val audioMgr: AudioManager?) {
             l.noiseOff = Random.nextFloat() * 4f
             l.env.setup(0.001f, 1e9f, 0.5f * 0.05f, 0f)
             l.filters = listOf(FilterSpec("lowpass", 90f, 90f, 0f, 0f))
-            out.layers.add(l)
+            addLayer(out, l)
         }
         nGust = time + rand(3f, 8f)
         nGull = time + rand(3f, 9f)
@@ -920,11 +947,13 @@ class AudioEngine(private val audioMgr: AudioManager?) {
     // =========================================================================
     // 渲染循环
     // =========================================================================
+    private val wetBuf = FloatArray(chunk)
+
     private fun renderChunk() {
         val dtS = chunk.toDouble() / sr
         val dt = 1f / sr
-        for (i in mixL.indices) { mixL[i] = 0f; mixR[i] = 0f }
-        var wetAcc = 0f
+        val dtD = 1.0 / sr
+        for (i in mixL.indices) { mixL[i] = 0f; mixR[i] = 0f; wetBuf[i] = 0f }
         // 事件调度
         if (hbOn) {
             if (hbNext < time) hbNext = time + 0.02
@@ -971,26 +1000,27 @@ class AudioEngine(private val audioMgr: AudioManager?) {
                 } else { gl = 0.7071f; gr = 0.7071f }
                 val spGain = if (v.spatial) v.sGain else 1f
                 val vg = v.gain * spGain * busVol
-                val wetV = l.wet * v.wetScale * busVol
+                // 湿声：voice 级 wetScale，环境层再乘自己的 l.wet
+                val wetV = (if (l.wet > 0f) l.wet * v.wetScale else v.wetScale) * busVol
                 for (s in 0 until chunk) {
                     if (o > 0f) { o -= dt; continue }
-                    val ev = l.env.step(dt)
+                    val ev = l.env.step(dtD)
                     if (ev <= 0f && l.env.done) break
                     var x: Float
                     if (l.isOsc) {
                         // 频率扫描
-                        val tt = l.env.t - l.delay
+                        val tt = (l.env.t - l.delay).toFloat()
                         var f = l.f0
                         if (l.f1 > 0 && l.sw > 0) {
                             val k = if (tt < l.sw) tt / l.sw else 1f
                             f = l.f0 * Math.pow((l.f1 / kotlin.math.max(l.f0, 0.01f)).toDouble(), k.toDouble()).toFloat()
                         }
-                        if (l.lfoFDepth > 0) f *= 1f + sin(2f * PI.toFloat() * l.lfoFRate * (l.age + tt).toFloat()) * 0.3f
-                        if (l.det != 0f) f *= Math.pow(2.0, (l.det / 12f).toDouble()).toFloat()
-                        l.fmPhase += 2f * PI.toFloat() * l.fmRate * dt
-                        val fmK = if (l.fmDepth > 0) 1f + sin(l.fmPhase) * (l.fmDepth / kotlin.math.max(f, 1f)) else 1f
-                        l.phase += 2f * PI.toFloat() * f * fmK * dt
-                        val ph = (l.phase / (2f * PI.toFloat())) % 1f
+                        if (l.lfoFDepth > 0) f *= (1.0 + sin(2.0 * PI * l.lfoFRate * (l.age + l.env.t - l.delay)) * 0.3).toFloat()
+                        if (l.det != 0f) f *= l.detMul.toFloat()
+                        l.fmPhase += 2.0 * PI * l.fmRate * dtD
+                        val fmK = if (l.fmDepth > 0) 1f + sin(l.fmPhase).toFloat() * (l.fmDepth / kotlin.math.max(f, 1f)) else 1f
+                        l.phase += 2.0 * PI * f * fmK * dtD
+                        val ph = ((l.phase / (2.0 * PI)) % 1.0).toFloat()
                         x = when (l.oscWave) {
                             "triangle" -> 2f / PI.toFloat() * kotlin.math.asin(sin(2f * PI.toFloat() * ph))
                             "saw" -> 2f * ph - 1f
@@ -1009,35 +1039,38 @@ class AudioEngine(private val audioMgr: AudioManager?) {
                     }
                     var out = x * ev
                     if (l.hasDrive) out = tanhDrive(out * l.drivePre) * l.drivePost
-                    l.age += dt
-                    val g2 = if (l.lfoGainDepth > 0) 1f + sin(2f * PI.toFloat() * l.lfoGainRate * l.age) * (l.lfoGainDepth / kotlin.math.max(l.baseGain, 0.001f)) else 1f
+                    l.age += dtD
+                    val g2 = if (l.lfoGainDepth > 0) (1.0 + sin(2.0 * PI * l.lfoGainRate * l.age) * (l.lfoGainDepth / kotlin.math.max(l.baseGain, 0.001f))).toFloat() else 1f
                     out *= vg * g2 * 0.5f
                     mixL[s] += out * gl
                     mixR[s] += out * gr
-                    wetAcc += out * wetV
+                    wetBuf[s] += out * wetV
                 }
             }
         }
         // 主链：闷音 + 混响 + 软限幅
-        val muffleBusVol = volSfx * volMaster * 0.5f
-        val target = muffleTarget
+        // 闷音单极点系数只在截止变化时重算（原先每个样本一次 exp）
+        var muffleCoef = -1f
+        var muffleCoefFor = -1f
         for (s in 0 until chunk) {
             // 闷音恢复
             if (muffleRecoverAt > 0 && time + s.toDouble() / sr >= muffleRecoverAt) {
                 muffleTarget = 1f
                 muffleRecoverAt = -1.0
             }
-            val cur = if (muffleTarget != target) target else muffleTarget
-            val fc = 20000f * cur
-            muffleC = (1.0 - exp(-2.0 * PI * fc / sr)).toFloat()
-            // 世界总线闷音（把整体都过低通——简化）
+            if (muffleTarget != muffleCoefFor) {
+                muffleCoefFor = muffleTarget
+                muffleCoef = (1.0 - exp(-2.0 * PI * 20000f * muffleTarget / sr)).toFloat()
+            }
+            val dryK = 1f - 0.55f * (1f - muffleTarget)   // 闷音越深，单声道低通占比越高
+            val loK = 1f - dryK
             var l = mixL[s]
             var r = mixR[s]
-            muffleY += ((l + r) * 0.5f - muffleY) * muffleC.toFloat()
-            val wet = reverb.process(wetAcc)
+            muffleY += ((l + r) * 0.5f - muffleY) * muffleCoef
+            val wet = reverb.process(wetBuf[s])
             val wl = wet * 0.6f
-            var ol = (l * 0.85f + muffleY * 0.15f + wl) * volMaster * 0.5f
-            var or2 = (r * 0.85f + muffleY * 0.15f + wl) * volMaster * 0.5f
+            val ol = (l * dryK + muffleY * loK + wl) * volMaster * 0.5f
+            val or2 = (r * dryK + muffleY * loK + wl) * volMaster * 0.5f
             mixL[s] = softClip(ol)
             mixR[s] = softClip(or2)
         }

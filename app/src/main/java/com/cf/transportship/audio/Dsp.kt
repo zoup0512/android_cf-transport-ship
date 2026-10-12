@@ -17,12 +17,8 @@ class Biquad {
     fun set(type: String, f: Float, q: Float, sr: Float) {
         val w0 = 2f * PI.toFloat() * f.coerceIn(10f, sr * 0.45f) / sr
         val cw = cos(w0)
-        var alpha = sin(w0) / (2f * q.coerceAtLeast(0.01f))
-        when (type) {
-            "lowpass" -> {}
-            "highpass" -> {}
-            "bandpass" -> alpha = sin(w0) * sinhf(1f, (2f * q).coerceAtLeast(0.001f)) / 2f // 近似
-        }
+        // RBJ: alpha = sin(w0) / (2Q)（对所有类型一致；带通为 0dB 峰增益形式）
+        val alpha = sin(w0) / (2f * q.coerceAtLeast(0.01f))
         val a0: Float
         when (type) {
             "lowpass" -> {
@@ -52,8 +48,6 @@ class Biquad {
         }
     }
 
-    private fun sinhf(x: Float, y: Float) = (exp(y.toDouble()) - exp(-y.toDouble())).toFloat() / 2f
-
     fun process(x: Float): Float {
         val y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
         x2 = x1; x1 = x
@@ -69,7 +63,7 @@ class FilterSpec(val type: String, val f0: Float, val f1: Float, val sw: Float, 
 
 /** 包络：线性起音 -> (保持) -> 指数衰减到 -60dB */
 class Env {
-    var t = 0f
+    var t = 0.0   // 双精度：长时间对局中 Float 累积 1/sr 会量化停滞
     var attack = 0.001f
     var dur = 0.1f
     var hold = 0f
@@ -83,18 +77,18 @@ class Env {
         this.peak = kotlin.math.max(peak, 1e-5f)
         this.hold = hold
         tau = dur / 6.907755f
-        t = 0f; done = false
+        t = 0.0; done = false
     }
 
-    fun step(dt: Float): Float {
+    fun step(dt: Double): Float {
         t += dt
         val total = attack + hold + dur + 0.004f
         if (t >= total) { done = true; return 0f }
         return when {
-            t < attack -> peak * (t / attack)
+            t < attack -> peak * (t / attack).toFloat()
             t < attack + hold -> peak
             else -> {
-                val td = t - attack - hold
+                val td = (t - attack - hold).toFloat()
                 if (td > dur) 0f else peak * exp(-td / tau)
             }
         }
